@@ -97,6 +97,7 @@ JValue InvokeVirtualOrInterfaceWithVarArgs(const ScopedObjectAccessAlreadyRunnab
     REQUIRES_SHARED(Locks::mutator_lock_);
 
 // num_frames is number of frames we look up for access check.
+NO_STACK_PROTECTOR
 jobject InvokeMethod(const ScopedObjectAccessAlreadyRunnable& soa,
                      jobject method,
                      jobject receiver,

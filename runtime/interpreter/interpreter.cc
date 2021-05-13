@@ -268,6 +268,7 @@ static JValue ExecuteSwitch(Thread* self,
   }
 }
 
+NO_STACK_PROTECTOR
 static inline JValue Execute(
     Thread* self,
     const CodeItemDataAccessor& accessor,
@@ -633,6 +634,7 @@ void EnterInterpreterFromDeoptimize(Thread* self,
   ret_val->SetJ(value.GetJ());
 }
 
+NO_STACK_PROTECTOR
 JValue EnterInterpreterFromEntryPoint(Thread* self, const CodeItemDataAccessor& accessor,
                                       ShadowFrame* shadow_frame) {
   DCHECK_EQ(self, Thread::Current());
