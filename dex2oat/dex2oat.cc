@@ -814,7 +814,8 @@ class Dex2Oat final {
       app_image_fd_(File::kInvalidFd),
       profile_file_fd_(File::kInvalidFd),
       timings_(timings),
-      force_determinism_(false)
+      force_determinism_(false),
+      profile_load_attempted_(false)
       {}
 
   ~Dex2Oat() {
@@ -1418,7 +1419,7 @@ class Dex2Oat final {
     // before reading compiler options.
     static_assert(CompilerFilter::kDefaultCompilerFilter == CompilerFilter::kSpeed);
     DCHECK_EQ(compiler_options_->GetCompilerFilter(), CompilerFilter::kSpeed);
-    if (UseProfile()) {
+    if (HasProfileInput()) {
       compiler_options_->SetCompilerFilter(CompilerFilter::kSpeedProfile);
     }
 
@@ -1428,8 +1429,6 @@ class Dex2Oat final {
 
     ProcessOptions(parser_options.get());
 
-    // Insert some compiler things.
-    InsertCompileOptions(argc, argv);
   }
 
   // Check whether the oat output files are writable, and open them for later. Also open a swap
@@ -1639,7 +1638,7 @@ class Dex2Oat final {
     if (!IsImage()) {
       return;
     }
-    if (profile_compilation_info_ != nullptr) {
+    if (DoProfileGuidedOptimizations()) {
       // TODO: The following comment looks outdated or misplaced.
       // Filter out class path classes since we don't want to include these in the image.
       HashSet<std::string> image_classes = profile_compilation_info_->GetClassDescriptors(
@@ -2533,12 +2532,16 @@ class Dex2Oat final {
     return is_host_;
   }
 
-  bool UseProfile() const {
+  bool HasProfileInput() const {
     return profile_file_fd_ != -1 || !profile_file_.empty();
   }
 
+  // Must be called after the profile is loaded.
   bool DoProfileGuidedOptimizations() const {
-    return UseProfile();
+    DCHECK(!HasProfileInput() || profile_load_attempted_)
+        << "The profile has to be loaded before we can decided "
+        << "if we do profile guided optimizations";
+    return profile_compilation_info_ != nullptr && !profile_compilation_info_->IsEmpty();
   }
 
   bool DoGenerateCompactDex() const {
@@ -2564,7 +2567,8 @@ class Dex2Oat final {
   }
 
   bool LoadProfile() {
-    DCHECK(UseProfile());
+    DCHECK(HasProfileInput());
+    profile_load_attempted_ = true;
     // TODO(calin): We should be using the runtime arena pool (instead of the
     // default profile arena). However the setup logic is messy and needs
     // cleaning up before that (e.g. the oat writers are created before the
@@ -2591,6 +2595,29 @@ class Dex2Oat final {
     }
 
     return true;
+  }
+
+  // If we're asked to speed-profile the app but we have no profile, or the profile
+  // is empty, change the filter to verify, and the image_type to none.
+  // A speed-profile compilation without profile data is equivalent to verify and
+  // this change will increase the precision of the telemetry data.
+  void UpdateCompilerOptionsBasedOnProfile() {
+    if (!DoProfileGuidedOptimizations() &&
+        compiler_options_->GetCompilerFilter() == CompilerFilter::kSpeedProfile) {
+      VLOG(compiler) << "Changing compiler filter to verify from speed-profile "
+          << "because of empty or non existing profile";
+
+      compiler_options_->SetCompilerFilter(CompilerFilter::kVerify);
+
+      // Note that we could reset the image_type to CompilerOptions::ImageType::kNone
+      // to prevent an app image generation.
+      // However, if we were pass an image file we would essentially leave the image
+      // file empty (possibly triggering some harmless errors when we try to load it).
+      //
+      // Letting the image_type_ be determined by whether or not we passed an image
+      // file will at least write the appropriate header making it an empty but valid
+      // image.
+    }
   }
 
  private:
@@ -2741,9 +2768,6 @@ class Dex2Oat final {
       elf_writers_.emplace_back(linker::CreateElfWriterQuick(*compiler_options_, oat_file.get()));
       elf_writers_.back()->Start();
       bool do_oat_writer_layout = DoDexLayoutOptimizations() || DoOatLayoutOptimizations();
-      if (profile_compilation_info_ != nullptr && profile_compilation_info_->IsEmpty()) {
-        do_oat_writer_layout = false;
-      }
       oat_writers_.emplace_back(new linker::OatWriter(
           *compiler_options_,
           timings_,
@@ -3102,6 +3126,9 @@ class Dex2Oat final {
   // The reason for invoking the compiler.
   std::string compilation_reason_;
 
+  // Whether or we attempted to load the profile (if given).
+  bool profile_load_attempted_;
+
   DISALLOW_IMPLICIT_CONSTRUCTORS(Dex2Oat);
 };
 
@@ -3242,13 +3269,22 @@ static dex2oat::ReturnCode Dex2oat(int argc, char** argv) {
 
   // If needed, process profile information for profile guided compilation.
   // This operation involves I/O.
-  if (dex2oat->UseProfile()) {
+  if (dex2oat->HasProfileInput()) {
     if (!dex2oat->LoadProfile()) {
       LOG(ERROR) << "Failed to process profile file";
       return dex2oat::ReturnCode::kOther;
     }
   }
 
+  // Check if we need to update any of the compiler options (such as the filter)
+  // and do it before anything else (so that the other operations have a true
+  // view of the state).
+  dex2oat->UpdateCompilerOptionsBasedOnProfile();
+
+  // Insert the compiler options in the key value store.
+  // We have to do this after we altered any incoming arguments
+  // (such as the compiler filter).
+  dex2oat->InsertCompileOptions(argc, argv);
 
   // Check early that the result of compilation can be written
   if (!dex2oat->OpenFile()) {
@@ -3285,7 +3321,7 @@ static dex2oat::ReturnCode Dex2oat(int argc, char** argv) {
   // Note: If dex2oat fails, installd will remove the oat files causing the app
   // to fallback to apk with possible in-memory extraction. We want to avoid
   // that, and thus we're lenient towards profile corruptions.
-  if (dex2oat->UseProfile()) {
+  if (dex2oat->DoProfileGuidedOptimizations()) {
     dex2oat->VerifyProfileData();
   }
 
